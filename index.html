@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Tap Metronome</title>
+<style>
+  :root {
+    --bg: #111418;
+    --fg: #f2f4f7;
+    --muted: #8a93a0;
+    --accent: #4fd1c5;
+    --accent-strong: #f6ad55;
+    --panel: #1c2128;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+  #tap-area {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    cursor: pointer;
+    padding: 16px;
+    transition: background-color 80ms ease-out;
+  }
+  #tap-area.flash { background-color: #1f2a2e; }
+  #bpm {
+    font-size: clamp(72px, 22vw, 180px);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+  }
+  .label { color: var(--muted); font-size: 18px; letter-spacing: .1em; text-transform: uppercase; }
+  #hint { color: var(--muted); font-size: 15px; text-align: center; }
+  #beats { display: flex; gap: 12px; height: 20px; margin-top: 8px; }
+  .beat {
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--panel);
+    transition: background-color 60ms;
+  }
+  .beat.on { background: var(--accent); }
+  .beat.on.first { background: var(--accent-strong); }
+
+  #controls {
+    background: var(--panel);
+    padding: 16px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    justify-content: center;
+    align-items: center;
+  }
+  button, select {
+    font: inherit;
+    font-size: 16px;
+    color: var(--fg);
+    background: #2a313b;
+    border: 1px solid #39424e;
+    border-radius: 10px;
+    padding: 12px 16px;
+    min-width: 48px;
+    cursor: pointer;
+  }
+  button:active { transform: scale(.97); }
+  #play { background: var(--accent); color: #0b1012; font-weight: 700; min-width: 110px; border: none; }
+  #play.playing { background: var(--accent-strong); }
+  .group { display: flex; gap: 6px; align-items: center; }
+</style>
+</head>
+<body>
+  <main id="tap-area" aria-label="Tap anywhere here to set the tempo">
+    <div id="bpm">--</div>
+    <div class="label">BPM</div>
+    <div id="beats"></div>
+    <div id="hint">Tap / click anywhere here (or press Space) in time with the beat</div>
+  </main>
+
+  <section id="controls">
+    <div class="group">
+      <button id="minus5" aria-label="Decrease 5 BPM">−5</button>
+      <button id="minus1" aria-label="Decrease 1 BPM">−1</button>
+      <button id="play">Start</button>
+      <button id="plus1" aria-label="Increase 1 BPM">+1</button>
+      <button id="plus5" aria-label="Increase 5 BPM">+5</button>
+    </div>
+    <div class="group">
+      <label for="meter" class="label" style="font-size:13px">Beats</label>
+      <select id="meter">
+        <option value="2">2</option>
+        <option value="3">3</option>
+        <option value="4" selected>4</option>
+        <option value="6">6</option>
+      </select>
+      <button id="reset">Reset</button>
+    </div>
+  </section>
+
+<script>
+(() => {
+  const MIN_BPM = 20, MAX_BPM = 300;
+  const TAP_TIMEOUT_MS = 2000;   // gap that starts a new tap sequence
+  const MAX_TAPS = 8;            // rolling window for averaging
+
+  const bpmEl = document.getElementById('bpm');
+  const hintEl = document.getElementById('hint');
+  const tapArea = document.getElementById('tap-area');
+  const beatsEl = document.getElementById('beats');
+  const playBtn = document.getElementById('play');
+  const meterEl = document.getElementById('meter');
+
+  let bpm = null;
+  let taps = [];
+  let playing = false;
+
+  // ---- Tap tempo ----
+  function tap() {
+    const now = performance.now();
+    if (taps.length && now - taps[taps.length - 1] > TAP_TIMEOUT_MS) taps = [];
+    taps.push(now);
+    if (taps.length > MAX_TAPS) taps.shift();
+
+    tapArea.classList.add('flash');
+    setTimeout(() => tapArea.classList.remove('flash'), 80);
+
+    if (taps.length < 2) {
+      hintEl.textContent = 'Keep tapping…';
+      return;
+    }
+    const avgInterval = (taps[taps.length - 1] - taps[0]) / (taps.length - 1);
+    setBpm(60000 / avgInterval);
+    hintEl.textContent = `${taps.length} taps`;
+  }
+
+  function setBpm(value) {
+    bpm = Math.min(MAX_BPM, Math.max(MIN_BPM, Math.round(value)));
+    bpmEl.textContent = bpm;
+  }
+
+  function adjust(delta) {
+    setBpm((bpm ?? 120) + delta);
+    taps = [];
+  }
+
+  // ---- Metronome (Web Audio lookahead scheduler) ----
+  let ctx = null;
+  let nextNoteTime = 0;
+  let beatIndex = 0;
+  let timerId = null;
+  const LOOKAHEAD_S = 0.1;
+  const TICK_MS = 25;
+
+  function click(time, accent) {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.frequency.value = accent ? 1500 : 1000;
+    gain.gain.setValueAtTime(0.0001, time);
+    gain.gain.exponentialRampToValueAtTime(0.6, time + 0.001);
+    gain.gain.exponentialRampToValueAtTime(0.0001, time + 0.05);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(time);
+    osc.stop(time + 0.06);
+  }
+
+  function scheduler() {
+    const beats = Number(meterEl.value);
+    while (nextNoteTime < ctx.currentTime + LOOKAHEAD_S) {
+      const idx = beatIndex % beats;
+      click(nextNoteTime, idx === 0);
+      const delayMs = Math.max(0, (nextNoteTime - ctx.currentTime) * 1000);
+      setTimeout(() => showBeat(idx), delayMs);
+      nextNoteTime += 60 / bpm;   // reads current bpm, so changes apply live
+      beatIndex++;
+    }
+  }
+
+  function start() {
+    if (bpm == null) setBpm(120);
+    ctx ??= new (window.AudioContext || window.webkitAudioContext)();
+    ctx.resume();
+    beatIndex = 0;
+    nextNoteTime = ctx.currentTime + 0.05;
+    timerId = setInterval(scheduler, TICK_MS);
+    scheduler();
+    playing = true;
+    playBtn.textContent = 'Stop';
+    playBtn.classList.add('playing');
+  }
+
+  function stop() {
+    clearInterval(timerId);
+    playing = false;
+    playBtn.textContent = 'Start';
+    playBtn.classList.remove('playing');
+    showBeat(-1);
+  }
+
+  // ---- Beat indicator ----
+  function renderBeats() {
+    beatsEl.innerHTML = '';
+    for (let i = 0; i < Number(meterEl.value); i++) {
+      const d = document.createElement('div');
+      d.className = 'beat' + (i === 0 ? ' first' : '');
+      beatsEl.appendChild(d);
+    }
+  }
+  function showBeat(idx) {
+    [...beatsEl.children].forEach((d, i) => d.classList.toggle('on', i === idx));
+  }
+
+  // ---- Wiring ----
+  tapArea.addEventListener('pointerdown', (e) => { e.preventDefault(); tap(); });
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'Space') {
+      e.preventDefault();
+      if (!e.repeat) tap();
+    }
+  });
+  playBtn.addEventListener('click', () => (playing ? stop() : start()));
+  document.getElementById('minus5').addEventListener('click', () => adjust(-5));
+  document.getElementById('minus1').addEventListener('click', () => adjust(-1));
+  document.getElementById('plus1').addEventListener('click', () => adjust(1));
+  document.getElementById('plus5').addEventListener('click', () => adjust(5));
+  document.getElementById('reset').addEventListener('click', () => {
+    taps = [];
+    bpm = null;
+    bpmEl.textContent = '--';
+    hintEl.textContent = 'Tap / click anywhere here (or press Space) in time with the beat';
+    if (playing) stop();
+  });
+  meterEl.addEventListener('change', () => { renderBeats(); beatIndex = 0; });
+
+  renderBeats();
+})();
+</script>
+</body>
+</html>
